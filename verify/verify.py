@@ -118,6 +118,53 @@ SCENARIOS = {
         "expect_cost": 3,
         "expect_contractions": 0,
     },
+    "three_entry_cycle": {
+        "payload": {
+            "points": ["r", "a", "b", "c"],
+            "root": "r",
+            "channels": [
+                {"id": "e5", "from": "a", "to": "b", "cost": 0},
+                {"id": "e2", "from": "b", "to": "c", "cost": 0},
+                {"id": "e3", "from": "c", "to": "a", "cost": 0},
+                {"id": "e0", "from": "r", "to": "a", "cost": 1},
+                {"id": "e1", "from": "r", "to": "b", "cost": 1},
+                {"id": "e4", "from": "r", "to": "c", "cost": 1},
+            ],
+        },
+        "expect_ids": ["e0", "e2", "e5"],
+        "expect_cost": 1,
+        "expect_contractions": 1,
+        "expect_expansion": {
+            "entering_channel": "e0",
+            "enters_node": "a",
+            "removed_cycle_channel": "e3",
+            "kept_cycle_channels": ["e2", "e5"],
+        },
+    },
+    # 同一拓扑、同一图，仅打乱通道与点的录入顺序：裁决必须不变
+    "three_entry_cycle_shuffled": {
+        "payload": {
+            "points": ["r", "c", "a", "b"],
+            "root": "r",
+            "channels": [
+                {"id": "e4", "from": "r", "to": "c", "cost": 1},
+                {"id": "e0", "from": "r", "to": "a", "cost": 1},
+                {"id": "e3", "from": "c", "to": "a", "cost": 0},
+                {"id": "e1", "from": "r", "to": "b", "cost": 1},
+                {"id": "e5", "from": "a", "to": "b", "cost": 0},
+                {"id": "e2", "from": "b", "to": "c", "cost": 0},
+            ],
+        },
+        "expect_ids": ["e0", "e2", "e5"],
+        "expect_cost": 1,
+        "expect_contractions": 1,
+        "expect_expansion": {
+            "entering_channel": "e0",
+            "enters_node": "a",
+            "removed_cycle_channel": "e3",
+            "kept_cycle_channels": ["e2", "e5"],
+        },
+    },
     "unreachable": {
         "payload": {
             "points": ["r", "a", "b", "z"],
@@ -148,6 +195,21 @@ def verify_ok_scenario(name: str, sc: dict) -> None:
           f"规范树标识序列 == {sc['expect_ids']}（实际 {body_api['canonical_ids']}）")
     check(body_api["record"]["contractions"] == sc["expect_contractions"],
           f"环收缩次数 == {sc['expect_contractions']}")
+    if "expect_expansion" in sc:
+        exps = body_api["record"]["expansions"]
+        check(len(exps) == 1, f"展开记录恰有 1 条（实际 {len(exps)}）")
+        if len(exps) == 1:
+            got, want = exps[0], sc["expect_expansion"]
+            check(got["entering_channel"] == want["entering_channel"],
+                  f"展开进入通道 == {want['entering_channel']}（实际 {got['entering_channel']}）")
+            check(got["enters_node"] == want["enters_node"],
+                  f"展开进入点 == {want['enters_node']}（实际 {got['enters_node']}）")
+            check(got["removed_cycle_channel"] == want["removed_cycle_channel"],
+                  f"被替换环边 == {want['removed_cycle_channel']}"
+                  f"（实际 {got['removed_cycle_channel']}）")
+            check(sorted(got["kept_cycle_channels"]) == want["kept_cycle_channels"],
+                  f"保留环边 == {want['kept_cycle_channels']}"
+                  f"（实际 {sorted(got['kept_cycle_channels'])}）")
     replayed = replay_record(
         sc["payload"]["points"], sc["payload"]["root"],
         channels_of(sc["payload"]), body_api["record"],
@@ -218,7 +280,13 @@ def main() -> int:
         return 1
 
     print("== 真实 API 与页面结果核对 ==")
-    for name in ("nested", "parallel", "canonical"):
+    for name in (
+        "nested",
+        "parallel",
+        "canonical",
+        "three_entry_cycle",
+        "three_entry_cycle_shuffled",
+    ):
         verify_ok_scenario(name, SCENARIOS[name])
     verify_unreachable_scenario()
     verify_invalid_inputs()

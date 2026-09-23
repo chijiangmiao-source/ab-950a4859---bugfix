@@ -113,6 +113,28 @@ UNREACHABLE = (
     ),
 )
 
+# 零代价三点环（a->b e5, b->c e2, c->a e3）配三个同代价根入口
+# （e0/e1/e4）。三棵最优树代价均为 1，字典序最小者为 [e0,e2,e5]，
+# 展开须以 e0 进入 a、替换环边 e3、保留 e2/e5。
+THREE_ENTRY_CYCLE = (
+    ["r", "a", "b", "c"],
+    "r",
+    make(
+        ["r", "a", "b", "c"],
+        "r",
+        [
+            ("e5", "a", "b", 0),
+            ("e2", "b", "c", 0),
+            ("e3", "c", "a", 0),
+            ("e0", "r", "a", 1),
+            ("e1", "r", "b", 1),
+            ("e4", "r", "c", 1),
+        ],
+    ),
+)
+
+THREE_ENTRY_EXPECT = ["e0", "e2", "e5"]
+
 
 class TestSamples:
     def test_nested_cycles(self):
@@ -163,6 +185,61 @@ class TestSamples:
         assert res["status"] == "unsolvable"
         assert res["unreachable"] == ["z"]
         assert res["reason"]
+
+
+class TestThreeEntryCycle:
+    """零代价环 + 三个同代价根入口：环收缩参与的同优裁决回归。"""
+
+    def assert_canonical(self, res, points, root, channels):
+        assert res["status"] == "ok"
+        assert res["total_cost"] == 1
+        assert res["canonical_ids"] == THREE_ENTRY_EXPECT
+        assert res["record"]["contractions"] == 1
+        exps = res["record"]["expansions"]
+        assert len(exps) == 1
+        exp = exps[0]
+        assert exp["entering_channel"] == "e0"
+        assert exp["enters_node"] == "a"
+        assert exp["removed_cycle_channel"] == "e3"
+        assert sorted(exp["kept_cycle_channels"]) == ["e2", "e5"]
+        tree_ids = sorted(e["id"] for e in res["tree"])
+        assert tree_ids == THREE_ENTRY_EXPECT
+        assert sum(e["cost"] for e in res["tree"]) == 1
+        assert replay_record(points, root, channels, res["record"]) == THREE_ENTRY_EXPECT
+
+    def test_three_entry_cycle(self):
+        points, root, channels = THREE_ENTRY_CYCLE
+        self.assert_canonical(solve(points, root, channels), points, root, channels)
+
+    def test_invariant_under_channel_order(self):
+        # 调整通道录入顺序后现象不变（全 720 种排列）
+        points, root, channels = THREE_ENTRY_CYCLE
+        seen = set()
+        for perm in itertools.permutations(channels):
+            res = solve(points, root, list(perm))
+            self.assert_canonical(res, points, root, list(perm))
+            seen.add(tuple(res["canonical_ids"]))
+        assert seen == {tuple(THREE_ENTRY_EXPECT)}
+
+    def test_invariant_under_point_order(self):
+        # 点的录入顺序同样不应影响规范树
+        _, root, channels = THREE_ENTRY_CYCLE
+        for perm in set(itertools.permutations(["r", "a", "b", "c"])):
+            res = solve(list(perm), root, channels)
+            assert res["canonical_ids"] == THREE_ENTRY_EXPECT
+
+    def test_record_self_consistent(self):
+        # 收缩记录须与正确树自洽（错误实现曾与 [e1,e2,e3] 自洽）
+        points, root, channels = THREE_ENTRY_CYCLE
+        res = solve(points, root, channels)
+        cycle = res["record"]["levels"][0]["cycle"]
+        assert cycle is not None
+        assert set(cycle["nodes"]) == {"a", "b", "c"}
+        assert set(cycle["channels"]) == {"e2", "e3", "e5"}
+        # 三个根入口的修正代价都为 1（= 自身代价 1 − 零环边代价 0）
+        adjusted = {r["channel"]: r["adjusted_cost"] for r in cycle["rewired_in"]}
+        assert adjusted == {"e0": 1, "e1": 1, "e4": 1}
+        assert replay_record(points, root, channels, res["record"]) == THREE_ENTRY_EXPECT
 
 
 class TestValidation:
@@ -301,3 +378,44 @@ class TestBruteForce:
                 assert res["total_cost"] == expect[0]
                 assert res["canonical_ids"] == expect[1]
                 assert replay_record(points, root, channels, res["record"]) == expect[1]
+
+    @pytest.mark.parametrize("seed", range(150))
+    def test_random_tied_cycles(self, seed):
+        """专门制造大量 0/同代价环与等代价入口：环收缩参与的同优裁决。
+
+        代价只取 {0, 1}，边编号随机分配（而非按生成顺序），使破平压力
+        集中在标识字典序上；对每张图暴力核对总代价、规范树与记录复算。
+        """
+        rng = random.Random(10000 + seed)
+        n = rng.randint(3, 6)
+        points = [f"v{i}" for i in range(n)]
+        root = points[0]
+        pairs = [(u, v) for u in points for v in points if u != v]
+        rng.shuffle(pairs)
+        m = rng.randint(n, min(14, len(pairs)))
+        id_nums = list(range(m))
+        rng.shuffle(id_nums)
+        channels = [
+            Channel(
+                id=f"e{num:02d}",
+                u=u,
+                v=v,
+                cost=rng.choice([0, 0, 0, 1, 1]),
+            )
+            for num, (u, v) in zip(id_nums, pairs[:m])
+        ]
+        # 保证根至少有若干出口，提高可解（从而出现收缩）的比例
+        res = solve(points, root, channels)
+        expect = brute_force(points, root, channels)
+        if expect is None:
+            assert res["status"] == "unsolvable"
+            assert res["unreachable"]
+        else:
+            assert res["status"] == "ok"
+            assert res["total_cost"] == expect[0]
+            assert res["canonical_ids"] == expect[1]
+            assert replay_record(points, root, channels, res["record"]) == expect[1]
+            # 逐边代价与总代价一致
+            assert sum(
+                c.cost for c in channels if c.id in res["canonical_ids"]
+            ) == res["total_cost"]

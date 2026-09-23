@@ -12,16 +12,28 @@
 
 规范树的求得分两步：
   1. 用 Edmonds 求出最小总代价 C*；
-  2. 按通道标识升序逐个尝试"强制入选"：若强制后仍存在代价为 C* 的
-     汇流树，则强制之。可证明最终强制集本身就是字典序最小的最优树。
-最后用 (代价, 是否规范边, 标识) 作为字典序边键再跑一次 Edmonds，
-保证产出的收缩记录恰好对应规范树。
+  2. 按通道标识升序逐个尝试"强制入选"：以二元偏好键
+     (代价, 0 若通道在强制集中否则 1, 标识) 再跑 Edmonds。该运行在
+     全部 C* 最优树中最小化"非强制通道数"，故其解包含整条强制集，
+     当且仅当存在一棵 C* 树包含它们——据此判定该通道可否强制。
+     对任意等大集合族，按元素升序贪心强制（只保留仍可补全为最优解
+     的前缀）恰好得到字典序最小的最优成员，因此最终强制集（恰 n-1
+     条）本身就是字典序最小的最优树。
+最后以完整规范集作为偏好键再跑一次 Edmonds：包含全部规范通道的
+C* 树唯一（即规范树自身），故本次运行的收缩 / 展开记录与规范树
+严格对应，同时保留真实的环发现结构。
+
+历史教训：不能用 (代价, 标识排序优先级, 标识) 标量键的单次 Edmonds
+破平。环的代价修正做键的逐项相减，次级键会参与"入口 vs 被替换环边"
+的成对交换比较；按标识排名赋权时，次优入口的排名差可能小于其替换
+掉的环边之和，从而被误判为最小（零代价环配三个同代价根入口时即会
+选出 [e1,e2,e3] 而非字典序更小的 [e0,e2,e5]）。二元 0/1 偏好没有
+此问题：它只计数"有多少条偏好边未入选"，且判定后有显式包含校验。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import gcd
 
 
 class ProblemError(Exception):
@@ -173,7 +185,9 @@ def _solve_level(
 ) -> list[_Edge] | None:
     """在当前层级上求解；返回以本层 _Edge 表示的入选边，无解返回 None。
 
-    levels / expansions 收集可复算记录。
+    levels / expansions 收集可复算记录。全部同优破平均通过 e.key
+    （有序群标量键 (主代价, 次优先级, 标识)）完成，调用方以不同键表达：
+    自然最小代价、强制集偏好、规范树偏好。
     """
     in_edge: dict[str, _Edge] = {}
     for n in sorted(nodes):
@@ -260,7 +274,9 @@ def _solve_level(
     }
 
     new_nodes = [n for n in nodes if n not in cyc] + [sname]
-    sub = _solve_level(new_nodes, root, new_edges, depth + 1, levels, expansions, sup_counter)
+    sub = _solve_level(
+        new_nodes, root, new_edges, depth + 1, levels, expansions, sup_counter
+    )
     if sub is None:
         return None
 
@@ -301,39 +317,37 @@ def _edmonds(
 
 
 # ---------------------------------------------------------------------------
-# 强制入选约束下的最小代价（用于规范树的字典序贪心）
+# 偏好键下的 Edmonds（用于规范树的字典序贪心）
 # ---------------------------------------------------------------------------
 
 
-def _identifier_priorities(channels: list[Channel]) -> dict[str, int]:
-    if not channels:
-        return {}
+def _preferring_edmonds(
+    points: list[str],
+    root: str,
+    channels: list[Channel],
+    preferred: frozenset[str],
+) -> tuple[list[_Edge], list[dict], list[dict]] | None:
+    """以 (代价, 0/1 偏好, 标识) 为键运行 Edmonds。
 
-    width = max(len(c.id) for c in channels)
-    encoded: dict[str, int] = {}
-    for channel in channels:
-        value = 0
-        for offset in range(width):
-            digit = ord(channel.id[offset]) + 1 if offset < len(channel.id) else 0
-            value = value * 128 + digit
-        encoded[channel.id] = value
-
-    floor = min(encoded.values())
-    scale = 0
-    for value in encoded.values():
-        delta = value - floor
-        if delta:
-            scale = delta if scale == 0 else gcd(scale, delta)
-    if scale == 0:
-        scale = 1
-
-    return {channel_id: (value - floor) // scale for channel_id, value in encoded.items()}
+    次级键把 preferred 中的通道排在同代价通道之前。沿收缩层级做键差后，
+    次级分量恰好计入交换所引入/移除的偏好边数，因此本次运行在全部
+    最小主代价（C*）汇流树中，选出"非偏好边计数"最小者；主代价层面
+    仍是标准 Edmonds，不会为偏好牺牲总代价。
+    """
+    edges = [
+        _Edge(
+            c, c.u, c.v,
+            (c.cost, 0 if c.id in preferred else 1, c.id),
+            enters=c.v, lower=None,
+        )
+        for c in channels
+    ]
+    return _edmonds(list(points), root, edges)
 
 
 # ---------------------------------------------------------------------------
 # 顶层求解
 # ---------------------------------------------------------------------------
-
 
 def reachable_from(root: str, channels: list[Channel]) -> set[str]:
     adj: dict[str, list[str]] = {}
@@ -362,25 +376,42 @@ def solve(points: list[str], root: str, channels: list[Channel]) -> dict:
             "unreachable": unreachable,
         }
 
-    # 1) 最小总代价
+    # 1) 最小总代价（自然键 (代价, 0, 标识)；次级位恒为 0 不影响比较）
     base_edges = [
         _Edge(c, c.u, c.v, (c.cost, 0, c.id), enters=c.v, lower=None) for c in channels
     ]
     run = _edmonds(list(points), root, base_edges)
     assert run is not None, "全部可达但 Edmonds 无解，内部不一致"
     best_cost = sum(e.orig.cost for e in run[0])
+    n_tree = len(points) - 1
 
-    # 2) 规范树：按标识升序贪心强制入选
-    priorities = _identifier_priorities(channels)
-    # 3) 以 (代价, 非规范边惩罚, 标识) 为键重跑，产出对应规范树的收缩记录
-    keyed_edges = [
-        _Edge(c, c.u, c.v, (c.cost, priorities[c.id], c.id), enters=c.v, lower=None)
-        for c in channels
-    ]
-    final_run = _edmonds(list(points), root, keyed_edges)
+    # 2) 规范树：按通道标识升序贪心强制入选。试探运行在全部 C* 树中
+    #    最小化非偏好边计数；它包含整条试探集，当且仅当存在 C* 树包含。
+    forced: set[str] = set()
+    for cand in sorted(channels, key=lambda c: c.id):
+        if cand.id in forced:
+            continue
+        trial = forced | {cand.id}
+        trial_run = _preferring_edmonds(points, root, channels, frozenset(trial))
+        if trial_run is None:
+            continue
+        trial_picked = trial_run[0]
+        if sum(e.orig.cost for e in trial_picked) != best_cost:
+            continue
+        if trial <= {e.orig.id for e in trial_picked}:
+            forced = trial
+            if len(forced) == n_tree:
+                break
+
+    assert len(forced) == n_tree, f"规范树强制集大小 {len(forced)} != {n_tree}"
+
+    # 3) 以完整规范集为偏好再跑一次：含全部规范边的 C* 树唯一（规范树
+    #    自身），故本次的收缩 / 展开记录严格对应规范树。
+    final_run = _preferring_edmonds(points, root, channels, frozenset(forced))
     assert final_run is not None
     picked, levels, expansions = final_run
     final_ids = sorted(e.orig.id for e in picked)
+    assert set(final_ids) == forced, "规范树偏好重跑未产出规范树"
     assert sum(e.orig.cost for e in picked) == best_cost, "规范树重跑改变了最小总代价"
 
     by_id = {c.id: c for c in channels}
