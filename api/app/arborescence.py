@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import gcd
 
 
 class ProblemError(Exception):
@@ -254,8 +253,9 @@ def _solve_level(
         "nodes": nodes_fwd,
         "channels": channels_fwd,
         "supernode": sname,
-        "rewired_in": rewired_in,
-        "rewired_out": rewired_out,
+        # 按通道标识排序，使记录与输入中通道的录入顺序无关
+        "rewired_in": sorted(rewired_in, key=lambda r: r["channel"]),
+        "rewired_out": sorted(rewired_out, key=lambda r: r["channel"]),
         "dropped_internal": sorted(dropped),
     }
 
@@ -301,33 +301,53 @@ def _edmonds(
 
 
 # ---------------------------------------------------------------------------
-# 强制入选约束下的最小代价（用于规范树的字典序贪心）
+# 规范树：按标识升序贪心强制入选（字典序最小的最优树）
 # ---------------------------------------------------------------------------
 
 
-def _identifier_priorities(channels: list[Channel]) -> dict[str, int]:
-    if not channels:
-        return {}
+def _forced_optimum(
+    points: list[str], root: str, channels: list[Channel], forced: set[str]
+) -> tuple[int, list[str]] | None:
+    """在强制入选 forced 中全部通道的约束下求最小代价汇流树。
 
-    width = max(len(c.id) for c in channels)
-    encoded: dict[str, int] = {}
-    for channel in channels:
-        value = 0
-        for offset in range(width):
-            digit = ord(channel.id[offset]) + 1 if offset < len(channel.id) else 0
-            value = value * 128 + digit
-        encoded[channel.id] = value
+    强制边 (u, v) 的语义：v 的其余未强制入边全部移除（每个非根点恰有一条
+    入选入边，故强制入边等价于独占该点的入边位）。若强制集本身成环、或
+    强制了进入根的通道、或某点因此无入边可用，则无可行树，返回 None。
+    返回 (总代价, 入选标识升序列表)。
+    """
+    forced_heads = {c.v for c in channels if c.id in forced}
+    edges = [
+        _Edge(c, c.u, c.v, (c.cost, 0, c.id), enters=c.v, lower=None)
+        for c in channels
+        if c.id in forced or c.v not in forced_heads
+    ]
+    run = _edmonds(list(points), root, edges)
+    if run is None:
+        return None
+    picked_ids = sorted(e.orig.id for e in run[0])
+    if not forced.issubset(picked_ids):
+        # 强制边未全部入选（例如进入了根，或同一入点被多条强制边占据）
+        return None
+    return sum(e.orig.cost for e in run[0]), picked_ids
 
-    floor = min(encoded.values())
-    scale = 0
-    for value in encoded.values():
-        delta = value - floor
-        if delta:
-            scale = delta if scale == 0 else gcd(scale, delta)
-    if scale == 0:
-        scale = 1
 
-    return {channel_id: (value - floor) // scale for channel_id, value in encoded.items()}
+def _canonical_tree(
+    points: list[str], root: str, channels: list[Channel], best_cost: int
+) -> list[str]:
+    """按标识升序逐条试探强制入选，仅当强制后最优代价仍为 best_cost 时接受。
+
+    可证明最终强制集本身就是字典序最小的最优树：设 S 为字典序最小最优树，
+    归纳可知处理完标识 x 时强制集恰为 S 中标识不超过 x 的部分——x ∈ S 时
+    S 自身即见证其可强制；x ∉ S 时任何包含强制集与 x 的最优树都会在首个
+    相异位置以 x 取代更大的标识，从而比 S 字典序更小，矛盾。
+    """
+    forced: set[str] = set()
+    for c in sorted(channels, key=lambda ch: ch.id):
+        trial = forced | {c.id}
+        result = _forced_optimum(points, root, channels, trial)
+        if result is not None and result[0] == best_cost:
+            forced = trial
+    return sorted(forced)
 
 
 # ---------------------------------------------------------------------------
@@ -370,17 +390,27 @@ def solve(points: list[str], root: str, channels: list[Channel]) -> dict:
     assert run is not None, "全部可达但 Edmonds 无解，内部不一致"
     best_cost = sum(e.orig.cost for e in run[0])
 
-    # 2) 规范树：按标识升序贪心强制入选
-    priorities = _identifier_priorities(channels)
-    # 3) 以 (代价, 非规范边惩罚, 标识) 为键重跑，产出对应规范树的收缩记录
+    # 2) 规范树：按标识升序贪心强制入选，最终强制集即字典序最小的最优树
+    canonical_ids = _canonical_tree(points, root, channels, best_cost)
+    assert len(canonical_ids) == len(points) - 1, "规范树边数应为 n-1"
+    canonical_set = set(canonical_ids)
+
+    # 3) 以 (代价, 非规范边惩罚, 标识) 为键重跑 Edmonds：
+    #    规范树是唯一的全规范边最优树，惩罚和恰为 0，
+    #    故产出的收缩 / 展开记录恰好对应规范树。
     keyed_edges = [
-        _Edge(c, c.u, c.v, (c.cost, priorities[c.id], c.id), enters=c.v, lower=None)
+        _Edge(
+            c, c.u, c.v,
+            (c.cost, 0 if c.id in canonical_set else 1, c.id),
+            enters=c.v, lower=None,
+        )
         for c in channels
     ]
     final_run = _edmonds(list(points), root, keyed_edges)
     assert final_run is not None
     picked, levels, expansions = final_run
     final_ids = sorted(e.orig.id for e in picked)
+    assert final_ids == canonical_ids, "规范树重跑结果与贪心强制集不一致"
     assert sum(e.orig.cost for e in picked) == best_cost, "规范树重跑改变了最小总代价"
 
     by_id = {c.id: c for c in channels}

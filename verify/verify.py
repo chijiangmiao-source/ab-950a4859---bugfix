@@ -1,8 +1,8 @@
 """verify 一次性服务：对真实 API 与经 Web 反代的同一请求做样例核对 + HTTP 冒烟。
 
-样例覆盖：嵌套环收缩、平行通道、同优规范树字典序、不可达点；
-另含输入错误（自环 / 结构非法）核对。全部断言通过则进程以 0 退出，
-任一失败立即以非零码退出。
+样例覆盖：嵌套环收缩、平行通道、同优规范树字典序、三入口零代价环
+（含不同通道录入顺序）、不可达点；另含输入错误（自环 / 结构非法）核对。
+全部断言通过则进程以 0 退出，任一失败立即以非零码退出。
 """
 
 from __future__ import annotations
@@ -118,8 +118,62 @@ SCENARIOS = {
         "expect_cost": 3,
         "expect_contractions": 0,
     },
-    "unreachable": {
+    # 三入口零代价环：e5/e2/e3 构成 a->b->c->a 零代价环，
+    # e0/e1/e4 为三条代价均为 1 的根入口。三棵同优树中规范解为 [e0, e2, e5]，
+    # 展开须以 e0 进入 a、替换环边 e3、保留 e2 与 e5。
+    "cycle3": {
         "payload": {
+            "points": ["r", "a", "b", "c"],
+            "root": "r",
+            "channels": [
+                {"id": "e5", "from": "a", "to": "b", "cost": 0},
+                {"id": "e2", "from": "b", "to": "c", "cost": 0},
+                {"id": "e3", "from": "c", "to": "a", "cost": 0},
+                {"id": "e0", "from": "r", "to": "a", "cost": 1},
+                {"id": "e1", "from": "r", "to": "b", "cost": 1},
+                {"id": "e4", "from": "r", "to": "c", "cost": 1},
+            ],
+        },
+        "expect_ids": ["e0", "e2", "e5"],
+        "expect_cost": 1,
+        "expect_contractions": 1,
+        "expect_expansions": [
+            {
+                "entering_channel": "e0",
+                "enters_node": "a",
+                "removed_cycle_channel": "e3",
+                "kept_cycle_channels": ["e2", "e5"],
+            }
+        ],
+    },
+    # 同一三入口环、不同通道录入顺序：响应须与 cycle3 完全一致
+    "cycle3_reordered": {
+        "payload": {
+            "points": ["r", "a", "b", "c"],
+            "root": "r",
+            "channels": [
+                {"id": "e0", "from": "r", "to": "a", "cost": 1},
+                {"id": "e4", "from": "r", "to": "c", "cost": 1},
+                {"id": "e3", "from": "c", "to": "a", "cost": 0},
+                {"id": "e1", "from": "r", "to": "b", "cost": 1},
+                {"id": "e5", "from": "a", "to": "b", "cost": 0},
+                {"id": "e2", "from": "b", "to": "c", "cost": 0},
+            ],
+        },
+        "expect_ids": ["e0", "e2", "e5"],
+        "expect_cost": 1,
+        "expect_contractions": 1,
+        "expect_expansions": [
+            {
+                "entering_channel": "e0",
+                "enters_node": "a",
+                "removed_cycle_channel": "e3",
+                "kept_cycle_channels": ["e2", "e5"],
+            }
+        ],
+        "expect_same_as": "cycle3",
+    },
+    "unreachable": {        "payload": {
             "points": ["r", "a", "b", "z"],
             "root": "r",
             "channels": [
@@ -133,7 +187,7 @@ SCENARIOS = {
 }
 
 
-def verify_ok_scenario(name: str, sc: dict) -> None:
+def verify_ok_scenario(name: str, sc: dict) -> dict | None:
     print(f"- 样例 {name}")
     st_api, body_api = http("POST", f"{API}/api/solve", sc["payload"])
     st_web, body_web = http("POST", f"{WEB}/api/solve", sc["payload"])
@@ -141,13 +195,28 @@ def verify_ok_scenario(name: str, sc: dict) -> None:
     check(st_web == 200 and body_web.get("status") == "ok", "经页面同源反代返回 200/ok")
     check(body_api == body_web, "页面反代结果与 API 直连完全一致")
     if body_api.get("status") != "ok":
-        return
+        return None
     check(body_api["total_cost"] == sc["expect_cost"],
           f"总代价 == {sc['expect_cost']}（实际 {body_api['total_cost']}）")
     check(body_api["canonical_ids"] == sc["expect_ids"],
           f"规范树标识序列 == {sc['expect_ids']}（实际 {body_api['canonical_ids']}）")
     check(body_api["record"]["contractions"] == sc["expect_contractions"],
           f"环收缩次数 == {sc['expect_contractions']}")
+    if "expect_expansions" in sc:
+        actual = [
+            {
+                "entering_channel": e["entering_channel"],
+                "enters_node": e["enters_node"],
+                "removed_cycle_channel": e["removed_cycle_channel"],
+                "kept_cycle_channels": sorted(e["kept_cycle_channels"]),
+            }
+            for e in body_api["record"]["expansions"]
+        ]
+        expect = [
+            {**exp, "kept_cycle_channels": sorted(exp["kept_cycle_channels"])}
+            for exp in sc["expect_expansions"]
+        ]
+        check(actual == expect, f"展开替换记录 == {expect}（实际 {actual}）")
     replayed = replay_record(
         sc["payload"]["points"], sc["payload"]["root"],
         channels_of(sc["payload"]), body_api["record"],
@@ -157,6 +226,7 @@ def verify_ok_scenario(name: str, sc: dict) -> None:
         c["cost"] for c in body_api["tree"] if c["id"] in set(body_api["canonical_ids"])
     )
     check(cost_sum == body_api["total_cost"], "逐边代价之和等于总代价")
+    return body_api
 
 
 def verify_unreachable_scenario() -> None:
@@ -218,8 +288,17 @@ def main() -> int:
         return 1
 
     print("== 真实 API 与页面结果核对 ==")
-    for name in ("nested", "parallel", "canonical"):
-        verify_ok_scenario(name, SCENARIOS[name])
+    bodies: dict[str, dict] = {}
+    for name in ("nested", "parallel", "canonical", "cycle3", "cycle3_reordered"):
+        body = verify_ok_scenario(name, SCENARIOS[name])
+        if body is not None:
+            bodies[name] = body
+    # 同一三入口环的不同录入顺序须得到完全一致的响应
+    for name, sc in SCENARIOS.items():
+        ref = sc.get("expect_same_as")
+        if ref and name in bodies and ref in bodies:
+            check(bodies[name] == bodies[ref],
+                  f"样例 {name} 与 {ref} 的响应完全一致（录入顺序无关）")
     verify_unreachable_scenario()
     verify_invalid_inputs()
     verify_http_smoke()

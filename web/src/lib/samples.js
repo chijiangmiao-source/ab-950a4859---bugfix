@@ -35,6 +35,19 @@ k3, r, c, 1
 k4, c, d, 1
 k5, r, d, 1`,
   },
+  cycle3: {
+    name: "三入口零代价环",
+    points: "r a b c",
+    root: "r",
+    channels: `# 零代价环 a->b->c->a（e5/e2/e3），三条代价均为 1 的根入口
+# 三棵同优树（代价均为 1），规范解为 e0 e2 e5：以 e0 进入 a、替换环边 e3
+e5, a, b, 0
+e2, b, c, 0
+e3, c, a, 0
+e0, r, a, 1
+e1, r, b, 1
+e4, r, c, 1`,
+  },
   unreachable: {
     name: "不可达点（无解）",
     points: "r a b z",

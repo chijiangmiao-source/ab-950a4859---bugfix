@@ -113,6 +113,28 @@ UNREACHABLE = (
     ),
 )
 
+# 三入口零代价环：环 a->b->c->a 由零代价通道 e5/e2/e3 构成，
+# 三条代价均为 1 的根入口 e0/e1/e4 分别进入 a/b/c。
+# 三棵同优树（代价均为 1）的升序标识序列：
+#   [e0, e2, e5] < [e1, e2, e3] < [e3, e4, e5]
+# 规范树须为 [e0, e2, e5]：展开时以 e0 进入 a、替换环边 e3、保留 e2 与 e5。
+THREE_ENTRY_CYCLE = (
+    ["r", "a", "b", "c"],
+    "r",
+    make(
+        ["r", "a", "b", "c"],
+        "r",
+        [
+            ("e5", "a", "b", 0),
+            ("e2", "b", "c", 0),
+            ("e3", "c", "a", 0),
+            ("e0", "r", "a", 1),
+            ("e1", "r", "b", 1),
+            ("e4", "r", "c", 1),
+        ],
+    ),
+)
+
 
 class TestSamples:
     def test_nested_cycles(self):
@@ -163,6 +185,52 @@ class TestSamples:
         assert res["status"] == "unsolvable"
         assert res["unreachable"] == ["z"]
         assert res["reason"]
+
+
+class TestThreeEntryCycle:
+    """环收缩参与的同优规范树裁决：三条同代价根入口 + 零代价三点环。"""
+
+    def check_canonical(self, points, root, channels):
+        res = solve(points, root, channels)
+        assert res["status"] == "ok"
+        assert res["total_cost"] == 1
+        # 三棵同优树中字典序最小者为 [e0, e2, e5]
+        assert res["canonical_ids"] == ["e0", "e2", "e5"]
+        assert [e["id"] for e in res["tree"]] == ["e0", "e2", "e5"]
+        assert sum(e["cost"] for e in res["tree"]) == 1
+        # 恰好一次三点环收缩
+        assert res["record"]["contractions"] == 1
+        cycles = [lv["cycle"] for lv in res["record"]["levels"] if lv["cycle"]]
+        assert len(cycles) == 1
+        assert set(cycles[0]["nodes"]) == {"a", "b", "c"}
+        assert sorted(cycles[0]["channels"]) == ["e2", "e3", "e5"]
+        # 展开：以 e0 进入 a，替换环边 e3，保留 e2 与 e5
+        exps = res["record"]["expansions"]
+        assert len(exps) == 1
+        exp = exps[0]
+        assert exp["supernode"] == cycles[0]["supernode"]
+        assert exp["entering_channel"] == "e0"
+        assert exp["enters_node"] == "a"
+        assert exp["removed_cycle_channel"] == "e3"
+        assert sorted(exp["kept_cycle_channels"]) == ["e2", "e5"]
+        # 记录独立复算仍得到同一规范树
+        assert replay_record(points, root, channels, res["record"]) == ["e0", "e2", "e5"]
+        return res
+
+    def test_three_entry_cycle(self):
+        points, root, channels = THREE_ENTRY_CYCLE
+        self.check_canonical(points, root, channels)
+
+    @pytest.mark.parametrize("seed", range(12))
+    def test_input_order_invariant(self, seed):
+        """通道录入顺序不影响规范树裁决与收缩 / 展开记录。"""
+        points, root, channels = THREE_ENTRY_CYCLE
+        shuffled = list(channels)
+        random.Random(seed).shuffle(shuffled)
+        res = self.check_canonical(points, root, shuffled)
+        # 记录应与原始顺序完全一致（含超点命名与逐层选择）
+        expect = solve(points, root, channels)
+        assert res["record"] == expect["record"]
 
 
 class TestValidation:
